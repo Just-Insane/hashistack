@@ -1,0 +1,6 @@
+name: hashistack
+runtime:
+  name: python
+  options:
+    virtualenv: venv
+description: HashiStack Deployment

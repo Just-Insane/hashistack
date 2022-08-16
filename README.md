@@ -1,5 +1,5 @@
 # Hashistack
 
-## overview
+## Overview
 
-![image]./hashistack.png
+![image](hashistack.png)

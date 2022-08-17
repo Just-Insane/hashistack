@@ -6,6 +6,7 @@ from pulumi_proxmoxve import Provider, ProviderVirtualEnvironmentArgs
 from pulumi_proxmoxve.vm import *
 import pulumi_command as command
 import pulumi_random as random
+import pulumi_tls as tls
 
 from diagrams import Cluster, Diagram, Edge
 from diagrams.onprem.compute import Server
@@ -31,19 +32,23 @@ private_key = config.require_secret("privateKey")
 proxmox_provider = Provider(
     "proxmox-provider",
     virtual_environment=ProviderVirtualEnvironmentArgs(
-        endpoint=os.environ.get("PROXMOX_VE_ENDPOINT"),
-        insecure=os.environ.get("PROXMOX_VE_INSECURE"),
-        username=os.environ.get("PROXMOX_VE_USERNAME"),
-        password=os.environ.get("PROXMOX_VE_PASSWORD"),
+        # endpoint=os.environ.get("PROXMOX_VE_ENDPOINT"),
+        # insecure=os.environ.get("PROXMOX_VE_INSECURE"),
+        # username=os.environ.get("PROXMOX_VE_USERNAME"),
+        # password=os.environ.get("PROXMOX_VE_PASSWORD"),
+        endpoint=config.require_secret("PROXMOX_VE_ENDPOINT"),
+        insecure=True,
+        username=config.require_secret("PROXMOX_VE_USERNAME"),
+        password=config.require_secret("PROXMOX_VE_PASSWORD"),
     ),
 )
 
-nodes = ["node01", "node02", "node03"]
+nodes = ["vault01", "vault02", "vault03"]
 for node in nodes:
     current_node = VirtualMachine(
         f"{node}",
         name=f"{node}",
-        description=f"Hashistack {node} - Master Cluster",
+        description=f"Hashistack {node} - Vault Cluster",
         node_name="pve",
         on_boot=True,  # start the vm during system bootup
         reboot=False,  # reboot the vm after it was created successfully
@@ -59,7 +64,7 @@ for node in nodes:
             sockets=2,
             type="host",  # set it to kvm64 for better vm migration
         ),
-        memory=VirtualMachineMemoryArgs(dedicated="4096", shared="4096"),  # unit: MB
+        memory=VirtualMachineMemoryArgs(dedicated="1024", shared="4096"),  # unit: MB
         operating_system=VirtualMachineOperatingSystemArgs(
             type="l26"  # l26: linux2.6-linux5.x
         ),
@@ -115,12 +120,83 @@ for node in nodes:
         opts=pulumi.ResourceOptions(depends_on=[current_node]),
     )
 
+    install_prereqs_node = command.remote.Command(
+        f"install_prereqs_{node}",
+        connection=connection,
+        create="yum -y install yum-utils && yum-config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo",
+        opts=pulumi.ResourceOptions(depends_on=[current_node]),
+    )
+
     install_consul_node = command.remote.Command(
         f"install_consul_{node}",
         connection=connection,
-        create="yum install -y yum-utils && yum-config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo && yum -y install consul",
-        opts=pulumi.ResourceOptions(depends_on=[current_node]),
+        create="yum -y install consul",
+        opts=pulumi.ResourceOptions(depends_on=[install_prereqs_node]),
     )
+
+    install_vault_node = command.remote.Command(
+        f"install_vault_{node}",
+        connection=connection,
+        create="yum -y install vault",
+        opts=pulumi.ResourceOptions(depends_on=[install_prereqs_node]),
+    )
+
+# Generate CA and Vault cert
+caPrivKey = tls.PrivateKey("caPrivKey", algorithm="RSA", rsa_bits=4096)
+
+caCert = tls.SelfSignedCert(
+    "caCert",
+    allowed_uses=["key_encipherment", "digital_signature", "cert_signing"],
+    is_ca_certificate=True,
+    validity_period_hours=87600,
+    subject=tls.SelfSignedCertSubjectArgs(
+        country="CA",
+        locality="Cambridge",
+        organization="Justin-Tech",
+        province="Ontario",
+    ),
+    private_key_pem=caPrivKey.private_key_pem,
+    opts=pulumi.ResourceOptions(depends_on=[caPrivKey]),
+)
+
+vaultPrivKey = tls.PrivateKey(
+    "vaultPrivKey",
+    algorithm="RSA",
+    rsa_bits=4096,
+)
+
+vaultCSR = tls.CertRequest(
+    "vaultCSR",
+    private_key_pem=vaultPrivKey.private_key_pem,
+    subject=tls.CertRequestSubjectArgs(
+        common_name="vault.justin-tech.com",
+        organization="Justin-Tech",
+    ),
+    opts=pulumi.ResourceOptions(depends_on=[vaultPrivKey]),
+)
+
+vaultCert = tls.LocallySignedCert(
+    "vaultCert",
+    allowed_uses=["digital_signature", "key_encipherment"],
+    ca_cert_pem=caCert.cert_pem,
+    ca_private_key_pem=caPrivKey.private_key_pem,
+    cert_request_pem=vaultCSR.cert_request_pem,
+    validity_period_hours=87600,
+    opts=pulumi.ResourceOptions(depends_on=[vaultCSR]),
+)
+
+pulumi.export("caPrivKey_pem", caPrivKey.private_key_pem)
+pulumi.export("caPrivKey_pubKey_pem", caPrivKey.public_key_pem)
+pulumi.export("caCert_pem", caCert.cert_pem)
+pulumi.export("vaultPrivKey_pem", vaultPrivKey.private_key_pem)
+pulumi.export("vaultPrivKey_pubKey_pem", vaultPrivKey.public_key_pem)
+pulumi.export("vaultCert_pem", vaultCert.cert_pem)
+
+caPrivKey_pem = open("caPrivKey.pem", "w")
+caPrivKey.private_key_pem.apply(lambda v: caPrivKey_pem.write(v))
+
+vaultPrivKey_pem = open("vaultPrivKey.pem", "w")
+vaultPrivKey.private_key_pem.apply(lambda v: vaultPrivKey_pem.write(v))
 
 with Diagram(name="Hashistack", show=False):
     with Cluster("Master Cluster"):
